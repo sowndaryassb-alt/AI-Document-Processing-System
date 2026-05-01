@@ -1,24 +1,17 @@
-import re
+import json
 import shutil
 import tempfile
 from datetime import date, datetime
 from pathlib import Path
 from typing import Annotated
-
+import ollama
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 app = FastAPI(title="AI Document Processing System")
 
 
-FIELD_ALIASES = {
-    "cr_no": "CR No",
-    "registered_in_the_grade": "Registered in the grade",
-    "occi_no": "OCCI No",
-    "date_of_issue": "Date of issue",
-    "date_of_expiry": "Date of expiry",
-    "head_office": "Head Office",
-}
+OLLAMA_MODEL = "llama3.2"
 
 
 class InvoiceExtraction(BaseModel):
@@ -146,17 +139,14 @@ def extract_text_with_ocr(pdf_path: Path) -> str:
 
 def extract_structured_fields(text: str) -> InvoiceExtraction:
     normalized = normalize_ocr_text(text)
-    values = {
-        "cr_no": find_value(normalized, [r"CR\s*No\.?", r"Commercial\s*Registration\s*No\.?"]),
-        "registered_in_the_grade": find_value(
-            normalized, [r"Registered\s*in\s*the\s*grade", r"Grade"]
-        ),
-        "occi_no": find_value(normalized, [r"OCCI\s*No\.?", r"Chamber\s*No\.?"]),
-        "date_of_issue": find_date_value(normalized, [r"Date\s*of\s*issue", r"Issue\s*Date"]),
-        "date_of_expiry": find_date_value(normalized, [r"Date\s*of\s*expiry", r"Expiry\s*Date"]),
-        "head_office": find_value(normalized, [r"Head\s*Office", r"Head\s*Office\s*Address"]),
-    }
-    return InvoiceExtraction.model_validate(values)
+    values = extract_fields_with_ollama(normalized)
+    try:
+        return InvoiceExtraction.model_validate(values)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Ollama returned data that did not match the expected schema: {exc}",
+        ) from exc
 
 
 def normalize_ocr_text(text: str) -> str:
@@ -169,40 +159,83 @@ def normalize_ocr_text(text: str) -> str:
     }
     for source, target in replacements.items():
         text = text.replace(source, target)
-    return re.sub(r"[ \t]+", " ", text)
+    return "\n".join(" ".join(line.split()) for line in text.splitlines())
 
 
-def find_value(text: str, labels: list[str]) -> str | None:
-    for label in labels:
-        patterns = [
-            rf"{label}\s*[:\-]\s*(?P<value>[^\n]+)",
-            rf"{label}\s+(?P<value>[^\n]+)",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text, flags=re.IGNORECASE)
-            if match:
-                return cleanup_extracted_value(match.group("value"))
-    return None
+def extract_fields_with_ollama(text: str) -> dict[str, str | None]:
+    prompt = build_extraction_prompt(text)
+    try:
+        response = ollama.generate(
+            model=OLLAMA_MODEL,
+            prompt=prompt,
+            format="json",
+            options={"temperature": 0},
+        )
+    except ollama.ResponseError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Ollama model error: {exc}",
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Could not connect to Ollama. Start Ollama locally and make sure "
+                f"model '{OLLAMA_MODEL}' is available."
+            ),
+        ) from exc
+
+    ollama_response = response.get("response", "")
+    return parse_ollama_json(ollama_response)
 
 
-def find_date_value(text: str, labels: list[str]) -> str | None:
-    date_pattern = (
-        r"(?P<value>\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4}|"
-        r"\d{4}-\d{1,2}-\d{1,2}|"
-        r"\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})"
+def build_extraction_prompt(text: str) -> str:
+    return (
+        "Extract document fields from the text below. "
+        "Return only one valid JSON object. Do not include markdown or explanation. "
+        "Use null when a field is missing. "
+        "Return dates as YYYY-MM-DD when possible, otherwise keep the date exactly as found. "
+        "The JSON keys must be exactly: "
+        '"CR No", "Registered in the gr'
+        'ade", "OCCI No", '
+        '"Date of issue", "Date of expiry", "Head Office".\n\n'
+        "Document text:\n"
+        f"{text}"
     )
-    for label in labels:
-        match = re.search(rf"{label}\s*[:\-]?\s*{date_pattern}", text, flags=re.IGNORECASE)
-        if match:
-            return match.group("value")
-    return None
 
 
-def cleanup_extracted_value(value: str) -> str:
-    value = value.split("  ")[0].strip()
-    return re.sub(
-        r"\s+(CR\s*No|Registered\s*in\s*the\s*grade|OCCI\s*No|Date\s*of\s*issue|Date\s*of\s*expiry|Head\s*Office)\b.*$",
-        "",
-        value,
-        flags=re.IGNORECASE,
-    ).strip(" :-")
+def parse_ollama_json(raw_response: str) -> dict[str, str | None]:
+    try:
+        parsed = json.loads(raw_response)
+    except json.JSONDecodeError:
+        start = raw_response.find("{")
+        end = raw_response.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise HTTPException(
+                status_code=422,
+                detail="Ollama did not return a JSON object.",
+            )
+        parsed = json.loads(raw_response[start : end + 1])
+
+    if not isinstance(parsed, dict):
+        raise HTTPException(status_code=422, detail="Ollama JSON output must be an object.")
+
+    return {
+        "CR No": normalize_optional_value(parsed.get("CR No")),
+        "Registered in the grade": normalize_optional_value(
+            parsed.get("Registered in the grade")
+        ),
+        "OCCI No": normalize_optional_value(parsed.get("OCCI No")),
+        "Date of issue": normalize_optional_value(parsed.get("Date of issue")),
+        "Date of expiry": normalize_optional_value(parsed.get("Date of expiry")),
+        "Head Office": normalize_optional_value(parsed.get("Head Office")),
+    }
+
+
+def normalize_optional_value(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in {"null", "none", "not found", "n/a"}:
+        return None
+    return text
